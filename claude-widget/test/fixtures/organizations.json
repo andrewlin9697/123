@@ -1,0 +1,4 @@
+[
+  { "uuid": "org-api-0000", "name": "API 組織", "capabilities": ["api"] },
+  { "uuid": "org-pro-1234", "name": "我的 Claude", "capabilities": ["chat", "claude_pro"] }
+]
