@@ -29,22 +29,23 @@ async function runWidget(env) {
   return { api, widget: env.setWidget, texts: collectTexts(env.setWidget) };
 }
 
-test("中尺寸：顯示 5 小時、每週、額度與上次更新", async () => {
+test("中尺寸：雙圓環、倒數、預估、額度、上次更新、趨勢", async () => {
   const env = widgetEnv("medium");
   const { texts, widget } = await runWidget(env);
   assert.ok(texts.includes("42%"));
   assert.ok(texts.includes("18%"));
-  assert.ok(texts.includes("3 小時後重置"));
+  assert.ok(texts.includes("3時00分後重置"));
   assert.ok(texts.includes("週四 14:00 重置"));
   assert.ok(texts.includes("約 15:45 用完"));
   assert.ok(texts.includes("重置前用不完"));
-  assert.ok(texts.includes("使用量額度"));
-  assert.ok(texts.includes("$3.20 / $50.00（6%）"));
-  assert.ok(texts.includes("上次更新 剛剛"));
+  assert.ok(texts.includes("使用量額度 $3.20 / $50.00"));
+  assert.ok(texts.includes("上次更新 13:00"));
   // 每 5 分鐘更新
   assert.equal(widget.refreshAfterDate.getTime(), NOW + 5 * MIN);
   // 深淺色：背景是動態顏色
   assert.ok(widget.backgroundColor.light && widget.backgroundColor.dark);
+  // 點小工具會執行腳本（打開詳細頁）
+  assert.equal(widget.url, "scriptable:///run/ClaudeUsage");
 });
 
 test("請求帶上 sessionKey cookie 與瀏覽器 header，並自動抓組織 ID 存進 Keychain", async () => {
@@ -69,9 +70,11 @@ test("已存組織 ID 時只打一次 usage", async () => {
 test("小尺寸＋參數 7d：主要顯示每週", async () => {
   const env = widgetEnv("small", { param: "7d" });
   const { texts } = await runWidget(env);
-  assert.ok(texts.includes("每週"));
-  assert.equal(texts[texts.indexOf("每週") + 1], "18%");
-  assert.ok(texts.includes("5 小時 42%"));
+  assert.equal(texts[1], "每週");
+  assert.equal(texts[2], "18%");
+  assert.equal(texts[3], "5 小時");
+  assert.equal(texts[4], "42%");
+  assert.ok(texts.includes("週四 14:00 重置"));
 });
 
 test("鎖定畫面圓環：圖片中有百分比與標籤", async () => {

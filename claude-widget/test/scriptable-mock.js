@@ -61,22 +61,38 @@ class WidgetStack {
   setPadding() {}
 }
 
+// 所有被 presentXxx() 預覽過的小工具（App 內預覽、示範畫面）
+const presentedWidgets = [];
+
 class ListWidget extends WidgetStack {
   constructor() {
     super();
     this.presented = null;
   }
-  async presentSmall() { this.presented = "small"; }
-  async presentMedium() { this.presented = "medium"; }
-  async presentAccessoryCircular() { this.presented = "accessoryCircular"; }
-  async presentAccessoryRectangular() { this.presented = "accessoryRectangular"; }
-  async presentAccessoryInline() { this.presented = "accessoryInline"; }
+  present(kind) { this.presented = kind; presentedWidgets.push(this); }
+  async presentSmall() { this.present("small"); }
+  async presentMedium() { this.present("medium"); }
+  async presentLarge() { this.present("large"); }
+  async presentAccessoryCircular() { this.present("accessoryCircular"); }
+  async presentAccessoryRectangular() { this.present("accessoryRectangular"); }
+  async presentAccessoryInline() { this.present("accessoryInline"); }
 }
 
 function collectTexts(node, out = []) {
   if (node instanceof WidgetText) out.push(node.text);
   if (node && node.children) node.children.forEach((c) => collectTexts(c, out));
   return out;
+}
+
+// UITable 裡所有文字儲存格的標題
+function tableTitles(table) {
+  const out = [];
+  for (const r of table.rows) for (const c of r.cells) if (c.type === "text") out.push(c.title);
+  return out;
+}
+
+function findRow(table, prefix) {
+  return table.rows.find((r) => r.cells.some((c) => c.type === "text" && String(c.title).startsWith(prefix)));
 }
 
 function collectImages(node, out = []) {
@@ -108,7 +124,8 @@ class Font {
 }
 for (const name of [
   "systemFont", "regularSystemFont", "mediumSystemFont", "semiboldSystemFont",
-  "boldSystemFont", "heavySystemFont", "boldRoundedSystemFont"
+  "boldSystemFont", "heavySystemFont", "boldRoundedSystemFont", "semiboldRoundedSystemFont",
+  "mediumRoundedSystemFont"
 ]) {
   Font[name] = (size) => new Font(name, size);
 }
@@ -119,6 +136,9 @@ class Rect { constructor(x, y, w, h) { Object.assign(this, { x, y, width: w, hei
 
 class Path {
   constructor() { this.ops = []; }
+  move(point) { this.ops.push(["move", point]); }
+  addLine(point) { this.ops.push(["line", point]); }
+  closeSubpath() { this.ops.push(["close"]); }
   addRoundedRect(rect, rx, ry) { this.ops.push(["roundedRect", rect, rx, ry]); }
   addLines(points) { this.ops.push(["lines", points.length]); }
   addRect(rect) { this.ops.push(["rect", rect]); }
@@ -131,6 +151,8 @@ class DrawContext {
   setStrokeColor(c) { this.ops.push(["stroke", c]); }
   setLineWidth(w) { this.ops.push(["lineWidth", w]); }
   fillPath() { this.ops.push(["fillPath"]); }
+  fillEllipse(rect) { this.ops.push(["fillEllipse", rect]); }
+  strokeEllipse(rect) { this.ops.push(["strokeEllipse", rect]); }
   strokePath() { this.ops.push(["strokePath"]); }
   setTextAlignedCenter() {}
   setTextColor() {}
@@ -163,7 +185,8 @@ function createEnv(opts = {}) {
     dark: !!opts.dark,
     handler: opts.handler || (() => ({ status: 500, body: "no handler" })),
     alerts: [],
-    alertScript: opts.alerts || []
+    alertScript: opts.alerts || [],
+    tables: []
   };
 
   class Request {
@@ -237,17 +260,44 @@ function createEnv(opts = {}) {
     async presentAlert() { return this.present(); }
   }
 
+  // UITable：記錄所有列，測試可以讀標題、觸發 onSelect。
+  class UITableRow {
+    constructor() { this.cells = []; }
+    addText(title, subtitle) {
+      const c = { type: "text", title, subtitle, centerAligned() {}, leftAligned() {}, rightAligned() {} };
+      this.cells.push(c);
+      return c;
+    }
+    addImage(image) {
+      const c = { type: "image", image, centerAligned() {}, leftAligned() {}, rightAligned() {} };
+      this.cells.push(c);
+      return c;
+    }
+  }
+  class UITable {
+    constructor() { this.rows = []; env.tables.push(this); }
+    addRow(r) { this.rows.push(r); }
+    removeAllRows() { this.rows = []; }
+    reload() {}
+    async present() { env.presentedTable = this; }
+  }
+
   const sandbox = {
     console,
     ListWidget, Color, Font, Size, Point, Rect, Path, DrawContext,
     Request, Keychain, FileManager, Notification, Alert,
-    UITable: class { addRow() {} removeAllRows() {} reload() {} async present() {} },
-    UITableRow: class { addText() { return {}; } },
+    UITable,
+    UITableRow,
+    SFSymbol: {
+      named: (name) => ({ name, applyFont() {}, image: { kind: "symbol", name } })
+    },
+    URLScheme: { forRunningScript: () => "scriptable:///run/ClaudeUsage" },
     Safari: { open: (u) => { env.openedUrl = u; } },
     Pasteboard: { paste: () => opts.clipboard || "" },
     Device: { isUsingDarkAppearance: () => env.dark },
     Script: {
       setWidget: (w) => { env.setWidget = w; },
+      setShortcutOutput: (v) => { env.shortcutOutput = v; },
       complete: () => { env.completed = true; }
     },
     config: { runsInWidget: false, runsInApp: true, widgetFamily: null, ...(opts.config || {}) },
@@ -283,4 +333,12 @@ function fakeClaude({ usage = "usage-normal.json", orgs = "organizations.json", 
   };
 }
 
-module.exports = { createEnv, fakeClaude, fixture, collectTexts, collectImages };
+// 讓排隊中的 Promise（例如 UITable 的 onSelect）跑完
+async function flush(times = 30) {
+  for (let i = 0; i < times; i++) await new Promise((r) => setImmediate(r));
+}
+
+module.exports = {
+  createEnv, fakeClaude, fixture, collectTexts, collectImages, tableTitles, findRow, flush,
+  presentedWidgets, Color
+};

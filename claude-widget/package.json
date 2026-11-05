@@ -4,7 +4,7 @@
   "private": true,
   "description": "iOS Scriptable 的 Claude 用量小工具（繁體中文、台灣時間）",
   "scripts": {
-    "test": "node --test test/logic.test.js test/widget.test.js"
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=18"
