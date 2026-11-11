@@ -203,6 +203,8 @@ iPhone 的 Safari 看不到 cookie，所以這一步要用電腦（Windows、Lin
 
 測試用 Node 跑，以假的 API 回應模擬 Scriptable 的 `ListWidget`、`Request`、`Keychain`、`FileManager`、`Notification`、`Alert` 等物件，不會連網路。
 
+每次 push 和 PR 都會在 GitHub Actions 自動跑一次（`.github/workflows/ci.yml`）。要注意測試的限制：`test/fixtures/` 裡的 API 回應是照 2026-10 看到的格式自己寫的假資料，不是從 claude.ai 錄下來的。測試全過只代表程式跟這些假資料一致；claude.ai 真的改版時測試不會發現，要靠小工具上的「回應格式不符」才知道。
+
 ```bash
 cd claude-widget
 npm test   # 需要 Node 18 以上
