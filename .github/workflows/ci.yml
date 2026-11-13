@@ -1,0 +1,29 @@
+name: ci
+# 只跑 claude-widget 的單元測試（約 1 秒）。測試用的是自己寫的假 API 回應，不會連 claude.ai，
+# 所以綠燈只代表程式跟假資料一致，不代表 claude.ai 的真實介面沒有改版。
+
+# 這個 repo 沒有 main 分支（預設分支是 claude/adoring-keller-h6ulmg），所以 push 不限分支。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: claude-widget
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 單元測試
+        run: npm test
