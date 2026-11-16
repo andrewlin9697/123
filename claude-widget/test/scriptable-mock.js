@@ -294,7 +294,7 @@ function createEnv(opts = {}) {
     },
     URLScheme: { forRunningScript: () => "scriptable:///run/ClaudeUsage" },
     Safari: { open: (u) => { env.openedUrl = u; } },
-    Pasteboard: { paste: () => opts.clipboard || "" },
+    Pasteboard: { paste: () => opts.clipboard || "", copyString: (v) => { env.copied = v; } },
     Device: { isUsingDarkAppearance: () => env.dark },
     Script: {
       setWidget: (w) => { env.setWidget = w; },

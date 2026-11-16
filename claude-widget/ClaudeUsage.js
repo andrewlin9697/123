@@ -15,7 +15,7 @@
 // 支援尺寸：主畫面小／中／大，鎖定畫面圓環／長條／單行；也可從「捷徑」執行取得文字摘要。
 // 資料來源是 claude.ai 用量頁使用的非官方介面，隨時可能改版失效。
 
-const VERSION = "2.1.0";
+const VERSION = "2.1.1";
 const BASE_URL = "https://claude.ai";
 const USAGE_PAGE = "https://claude.ai/settings/usage";
 const KEY_SESSION = "claude-usage-tw.sessionKey";
@@ -242,8 +242,50 @@ function normalizeUsage(data) {
       models.push({ label: windowLabel(key), percent: win.percent, resetAt: win.resetAt });
     }
   }
-  return { fiveHour, sevenDay, extra: parseExtra(data.extra_usage), models, fields: cleanFields(Object.keys(data)
-    .filter((k) => data[k] !== null && data[k] !== undefined)) };
+  return {
+    fiveHour,
+    sevenDay,
+    extra: parseExtra(data.extra_usage),
+    models,
+    fields: cleanFields(Object.keys(data).filter((k) => data[k] !== null && data[k] !== undefined)),
+    shape: describeShape(data)
+  };
+}
+
+// 把 API 回應整理成可以貼給開發者看的「結構」：保留欄位名稱、數字、日期和短代號，
+// 其他文字（可能是名字、信箱、ID）一律遮掉。回應裡本來就沒有 sessionKey。
+function maskValue(v, depth) {
+  if (v === null || typeof v === "boolean") return v;
+  if (typeof v === "number") return Number.isFinite(v) ? v : "<數字>";
+  if (typeof v === "string") {
+    const idLike = /[0-9a-f]{8}-[0-9a-f]{4}/i.test(v);
+    if (/^\d{4}-\d{2}-\d{2}[T 0-9:.+Zz-]*$/.test(v) && v.length <= 40) return v;
+    if (!idLike && /^[A-Za-z][A-Za-z0-9_ .:+-]{0,29}$/.test(v)) return v;
+    return `<文字 ${v.length} 字>`;
+  }
+  if (depth >= 6) return "<…>";
+  if (Array.isArray(v)) {
+    const out = v.slice(0, 8).map((x) => maskValue(x, depth + 1));
+    if (v.length > 8) out.push(`<還有 ${v.length - 8} 筆>`);
+    return out;
+  }
+  if (typeof v === "object") {
+    const out = {};
+    Object.keys(v).slice(0, 40).forEach((k, i) => {
+      const safe = /^[A-Za-z0-9_.-]{1,40}$/.test(k) && !/[0-9a-f]{8}-[0-9a-f]{4}/i.test(k);
+      out[safe ? k : `<鍵 ${i + 1}>`] = maskValue(v[k], depth + 1);
+    });
+    return out;
+  }
+  return "<?>";
+}
+
+function describeShape(data) {
+  try {
+    return JSON.stringify(maskValue(data, 0), null, 1).slice(0, 12000);
+  } catch (e) {
+    return "";
+  }
 }
 
 function windowLabel(key) {
@@ -639,7 +681,14 @@ function sanitizeState(raw) {
           .filter(Boolean)
           .slice(0, MAX_CATEGORIES)
         : [];
-      s.usage = { fiveHour, sevenDay, extra: cleanExtra(u.extra), models, fields: cleanFields(u.fields) };
+      s.usage = {
+        fiveHour,
+        sevenDay,
+        extra: cleanExtra(u.extra),
+        models,
+        fields: cleanFields(u.fields),
+        shape: typeof u.shape === "string" ? u.shape.slice(0, 12000) : ""
+      };
     }
   }
   if (isTime(raw.fetchedAt)) s.fetchedAt = raw.fetchedAt;
@@ -1998,9 +2047,9 @@ function detailRows(table, view, settings, now, handlers) {
         "每日明細",
         d.days.map((x) => `${x.isToday ? "今天" : x.label} ${x.pct === null ? "–" : `${x.pct}%`}`).join("・"),
         null,
-        54
+        74
       );
-      if (d.periodsText) addInfo("時段分布", d.periodsText, null, 54);
+      if (d.periodsText) addInfo("時段分布", d.periodsText, null, 60);
     } else {
       addInfo("累積資料中…", "小工具每次更新會記錄一筆，過一陣子就能看到每天用了多少");
     }
@@ -2010,9 +2059,9 @@ function detailRows(table, view, settings, now, handlers) {
     if (view.fields.length) {
       addInfo(
         "claude.ai 提供的欄位",
-        `${view.fields.join("、")}\n只有這些分類能顯示；claude.ai 不提供每個對話或專案的明細`,
+        `${view.fields.join("、")}\n小工具只能顯示 claude.ai 有提供的分類`,
         null,
-        74
+        104
       );
     }
   }
@@ -2038,6 +2087,7 @@ function detailRows(table, view, settings, now, handlers) {
   action("🔄 立即更新", handlers.refresh);
   action("🌐 打開 claude.ai 用量頁", handlers.openPage);
   action("👀 預覽小工具", handlers.preview);
+  action("📋 複製欄位結構（回報用）", handlers.copyShape);
   action(`🔔 通知設定（高用量 ${settings.alertPct ? `${settings.alertPct}%` : "關"}）`, handlers.settings);
   action("🔑 重設登入資料", handlers.reset, PALETTE.red());
 
@@ -2068,6 +2118,18 @@ async function showDetail(initial) {
     }
   };
   handlers.openPage = () => Safari.open(USAGE_PAGE);
+  handlers.copyShape = async () => {
+    const shape = state.usage && state.usage.shape;
+    if (!shape) {
+      await showAlert("還沒有資料", "請先按「立即更新」成功一次。");
+      return;
+    }
+    Pasteboard.copyString(shape);
+    await showAlert(
+      "已複製欄位結構",
+      "內容是 claude.ai 用量回應的欄位名稱、數字和日期；名字、信箱、ID 之類的文字已經遮掉，也不含 sessionKey。\n\n貼出去之前可以先貼到備忘錄看一眼。"
+    );
+  };
   handlers.preview = () => previewWidget(state, error);
   handlers.settings = async () => {
     settings = await settingsMenu(settings);
@@ -2155,7 +2217,7 @@ const __api = {
   parseIsoTime, parseTime, parseWindow, parseExtra, normalizeUsage, pickOrganization, levelFor,
   currentWindow, sameWindow, recordSample, predictExhaust, paceFor, taipeiParts, fmtClock, fmtWhen,
   fmtDuration, fmtDurationShort, fmtCountdown, fmtAgo, fmtMoney, predictionText, predictionShort,
-  extraText, parseParam, parseMode, usageDeltas, dailyBreakdown, windowLabel, nextRefreshAt, cleanSettings, sanitizeState, planNotifications,
+  extraText, parseParam, parseMode, maskValue, describeShape, usageDeltas, dailyBreakdown, windowLabel, nextRefreshAt, cleanSettings, sanitizeState, planNotifications,
   applySuccess, buildView, statusLine, summaryText, demoState, sparkImage, ringImage,
   apiGet, fetchUsage, refresh, applyNotifications, buildWidget, loadState, saveState,
   loadSettings, saveSettings, resetCredentials, setupWizard, settingsMenu, showDetail, main,

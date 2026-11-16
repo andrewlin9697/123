@@ -4,7 +4,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { createEnv, fakeClaude, collectTexts, collectImages, tableTitles } = require("./scriptable-mock");
+const { createEnv, fakeClaude, collectTexts, collectImages, tableTitles, findRow, flush } = require("./scriptable-mock");
 
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
@@ -273,4 +273,56 @@ test("捷徑摘要也包含今天用了多少", async () => {
   const a = await env.ready;
   await a.main();
   assert.ok(env.shortcutOutput.endsWith("；今天用掉每週額度 8%"));
+});
+
+test("欄位結構：保留欄位名稱、數字、日期，遮掉名字、信箱、ID", () => {
+  const shape = JSON.parse(api.describeShape({
+    five_hour: { utilization: 36.5, resets_at: "2026-10-19T08:00:00.123456+00:00" },
+    seven_day_breakdown: [
+      { model: "claude-opus", utilization: 30, owner: "someone@example.com" },
+      { model: "Claude Sonnet 5", utilization: 19, org: "7f66876b-d7c4-46d5-802c-6398e2a862e0" }
+    ],
+    spend: { currency: "USD", used: 0, note: "這是一段不該外流的中文備註" },
+    "7f66876b-d7c4-46d5-802c-6398e2a862e0": { n: 1 },
+    member_dashboard_available: false,
+    limits: null
+  }));
+  assert.equal(shape.five_hour.utilization, 36.5);
+  assert.equal(shape.five_hour.resets_at, "2026-10-19T08:00:00.123456+00:00");
+  assert.equal(shape.seven_day_breakdown[0].model, "claude-opus");
+  assert.equal(shape.seven_day_breakdown[0].owner, "<文字 19 字>");
+  assert.equal(shape.seven_day_breakdown[1].model, "Claude Sonnet 5");
+  assert.equal(shape.seven_day_breakdown[1].org, "<文字 36 字>");
+  assert.equal(shape.spend.currency, "USD");
+  assert.equal(shape.spend.note, "<文字 13 字>");
+  assert.deepEqual(shape["<鍵 4>"], { n: 1 });
+  assert.equal(shape.member_dashboard_available, false);
+  assert.equal(shape.limits, null);
+  // 很長的陣列、很深的結構、奇怪的輸入都不會出錯
+  assert.equal(JSON.parse(api.describeShape({ a: new Array(20).fill(1) })).a.length, 9);
+  assert.equal(typeof api.describeShape(null), "string");
+  assert.ok(api.describeShape({ a: "x".repeat(50000) }).length < 200);
+});
+
+test("App 詳細頁：「複製欄位結構」把遮過的結構放進剪貼簿，不含金鑰", async () => {
+  const body = JSON.stringify({
+    five_hour: { utilization: 36, resets_at: "2026-10-19T08:00:00Z" },
+    seven_day: { utilization: 49, resets_at: "2026-10-22T06:00:00Z" },
+    seven_day_breakdown: { chat: 20, code: 29, email: "a@b.co" }
+  });
+  const env = createEnv({
+    now: NOW,
+    keychain: { [KEYS.session]: KEY },
+    handler: fakeClaude({ usage: body }),
+    alerts: []
+  });
+  const a = await env.ready;
+  await a.main();
+  findRow(env.presentedTable, "📋 複製欄位結構").onSelect();
+  await flush();
+  const copied = JSON.parse(env.copied);
+  assert.deepEqual({ ...copied.seven_day_breakdown }, { chat: 20, code: 29, email: "<文字 6 字>" });
+  assert.ok(!env.copied.includes(KEY));
+  assert.ok(!env.copied.includes("org-pro-1234"));
+  assert.equal(env.alerts[env.alerts.length - 1].title, "已複製欄位結構");
 });
