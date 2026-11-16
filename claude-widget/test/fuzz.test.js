@@ -98,7 +98,7 @@ test("亂數 API 回應 × 所有尺寸：不會出現未預期的錯誤", async
     current = m.response();
     env.setNow(NOW + i * 2 * MIN);
     env.sandbox.config.widgetFamily = FAMILIES[i % FAMILIES.length];
-    env.sandbox.args.widgetParameter = m.pick([null, "7d", "5h", "亂打"]);
+    env.sandbox.args.widgetParameter = m.pick([null, "7d", "5h", "亂打", "明細", "7d 明細"]);
     env.setWidget = null;
     env.completed = false;
     await api.main();

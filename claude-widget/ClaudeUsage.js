@@ -10,11 +10,12 @@
 // 小工具參數：
 //   （空白）或 5h  → 主要顯示 5 小時用量
 //   7d             → 主要顯示每週用量
+//   明細           → 顯示「用量花在哪」：每天用了多少、集中在哪個時段（小／中／鎖定畫面長條、單行）
 //
 // 支援尺寸：主畫面小／中／大，鎖定畫面圓環／長條／單行；也可從「捷徑」執行取得文字摘要。
 // 資料來源是 claude.ai 用量頁使用的非官方介面，隨時可能改版失效。
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 const BASE_URL = "https://claude.ai";
 const USAGE_PAGE = "https://claude.ai/settings/usage";
 const KEY_SESSION = "claude-usage-tw.sessionKey";
@@ -64,10 +65,18 @@ const DEFAULT_SETTINGS = {
 const RESET_CHOICES = [1, 50, 80, 0];
 const ALERT_CHOICES = [70, 80, 90, 0];
 
-const MODEL_WINDOWS = [
-  ["seven_day_opus", "Opus 每週"],
-  ["seven_day_sonnet", "Sonnet 每週"]
-];
+// claude.ai 另外回傳的分類用量。沒列在這裡的欄位也會顯示（用欄位名稱當標籤）。
+const KNOWN_WINDOWS = {
+  seven_day_opus: "Opus 每週",
+  seven_day_sonnet: "Sonnet 每週",
+  seven_day_oauth_apps: "OAuth App 每週",
+  seven_day_cowork: "Cowork 每週"
+};
+const MAIN_FIELDS = ["five_hour", "seven_day", "extra_usage"];
+const MAX_CATEGORIES = 6;
+// 一天分成四個時段（台灣時間），每段 6 小時。
+const PERIODS = ["凌晨", "上午", "下午", "晚上"];
+const WHERE_WORDS = ["明細", "去向", "花在哪", "每日", "where", "detail", "breakdown", "daily"];
 
 const ERRORS = {
   "no-key": { title: "尚未設定", hint: "點一下開始設定", short: "未設定" },
@@ -223,12 +232,30 @@ function normalizeUsage(data) {
   if (!fiveHour && !sevenDay) {
     return null;
   }
+  const keys = Object.keys(data).filter((k) => !MAIN_FIELDS.includes(k));
+  const ordered = Object.keys(KNOWN_WINDOWS).filter((k) => keys.includes(k))
+    .concat(keys.filter((k) => !KNOWN_WINDOWS[k]));
   const models = [];
-  for (const [key, label] of MODEL_WINDOWS) {
+  for (const key of ordered) {
     const win = parseWindow(data[key]);
-    if (win) models.push({ label, percent: win.percent, resetAt: win.resetAt });
+    if (win && models.length < MAX_CATEGORIES) {
+      models.push({ label: windowLabel(key), percent: win.percent, resetAt: win.resetAt });
+    }
   }
-  return { fiveHour, sevenDay, extra: parseExtra(data.extra_usage), models };
+  return { fiveHour, sevenDay, extra: parseExtra(data.extra_usage), models, fields: cleanFields(Object.keys(data)
+    .filter((k) => data[k] !== null && data[k] !== undefined)) };
+}
+
+function windowLabel(key) {
+  if (KNOWN_WINDOWS[key]) return KNOWN_WINDOWS[key];
+  const m = /^(seven_day|five_hour)_(.+)$/.exec(key);
+  const name = (m ? m[2] : String(key)).replace(/_/g, " ").slice(0, 16);
+  return m ? `${name} ${m[1] === "seven_day" ? "每週" : "5 小時"}` : name;
+}
+
+function cleanFields(list) {
+  if (!Array.isArray(list)) return [];
+  return list.filter((k) => typeof k === "string" && /^[A-Za-z0-9_.-]{1,40}$/.test(k)).slice(0, 24);
 }
 
 // 帳號可能同時屬於 API 組織，優先選有 claude_max / claude_pro / chat 的。
@@ -337,6 +364,72 @@ function paceFor(win, lengthMs, now) {
     level: kind === "fast" ? (diff > 25 ? "red" : "orange") : "green",
     text: `${label}（時間過了 ${expected}%，用了 ${win.percent}%）`
   };
+}
+
+// 相鄰兩筆樣本之間增加了多少用量（百分點）。視窗重置後從 0 重新算。
+function usageDeltas(samples) {
+  const list = cleanSamples(samples).sort((a, b) => a.t - b.t);
+  const deltas = [];
+  for (let i = 1; i < list.length; i++) {
+    const a = list[i - 1];
+    const b = list[i];
+    let d;
+    if (sameWindow(a.r, b.r)) d = Math.max(0, b.p - a.p);
+    else if (a.r !== null && b.r !== null) d = b.p;
+    else d = b.p >= a.p ? b.p - a.p : b.p;
+    if (d > 0) deltas.push({ t: b.t, d });
+  }
+  return { list, deltas };
+}
+
+// 「用量花在哪」：把每週用量的增加量分到最近 7 天（台灣時間）與四個時段。
+// 數字是「佔每週額度的百分點」。開始記錄以前的日子是 null（沒有資料）。
+function dailyBreakdown(samples, now) {
+  const { list, deltas } = usageDeltas(samples);
+  const today = taipeiDayIndex(now);
+  const firstDay = list.length ? taipeiDayIndex(list[0].t) : null;
+  const days = [];
+  for (let i = 6; i >= 0; i--) {
+    const index = today - i;
+    days.push({
+      index,
+      // 1970-01-01 是星期四
+      label: WEEKDAYS[(((index + 4) % 7) + 7) % 7],
+      isToday: i === 0,
+      pct: firstDay !== null && index >= firstDay ? 0 : null
+    });
+  }
+  const buckets = PERIODS.map(() => 0);
+  let total = 0;
+  for (const { t, d } of deltas) {
+    const day = days.find((x) => x.index === taipeiDayIndex(t));
+    if (!day || day.pct === null) continue;
+    day.pct += d;
+    total += d;
+    buckets[Math.floor(taipeiParts(t).hour / 6)] += d;
+  }
+  const known = days.filter((x) => x.pct !== null);
+  const max = known.reduce((m, x) => Math.max(m, x.pct), 0);
+  const busiest = max > 0 ? known.find((x) => x.pct === max) : null;
+  const periods = total > 0
+    ? PERIODS.map((label, i) => ({ label, share: Math.round((buckets[i] / total) * 100) }))
+      .filter((x) => x.share > 0)
+    : [];
+  return {
+    days,
+    today: days[6].pct,
+    total,
+    max,
+    avg: known.length ? Math.round(total / known.length) : null,
+    busiest,
+    periods,
+    periodsText: periods.map((x) => `${x.label} ${x.share}%`).join("・"),
+    hasData: list.length >= 2
+  };
+}
+
+function fmtToday(daily) {
+  return daily && isNum(daily.today) ? `今天 +${daily.today}%` : "";
 }
 
 // ---- 時間格式（Asia/Taipei） ----
@@ -451,10 +544,16 @@ function extraText(extra) {
   return `${used} / ${fmtMoney(extra.limit, extra.currency)}`;
 }
 
+// 參數可以混著寫，例如「7d 明細」。
 function parseParam(raw) {
   const p = String(raw || "").trim().toLowerCase();
-  if (["7d", "7", "week", "weekly", "w", "週", "每週", "一週"].includes(p)) return "7d";
+  if (/週|周/.test(p) || /(^|[^a-z0-9])(7d|7|w|week|weekly)($|[^a-z0-9])/.test(p)) return "7d";
   return "5h";
+}
+
+function parseMode(raw) {
+  const p = String(raw || "").toLowerCase();
+  return WHERE_WORDS.some((w) => p.includes(w)) ? "where" : "usage";
 }
 
 // 下次更新：5 分鐘後，或任一視窗重置後 1 分鐘（取較早者）。被限流時拉長。
@@ -534,11 +633,13 @@ function sanitizeState(raw) {
         ? u.models
           .map((m) => {
             const w = cleanWindow(m);
-            return w && m && typeof m.label === "string" ? { label: m.label, ...w } : null;
+            return w && m && typeof m.label === "string" && m.label
+              ? { label: m.label.slice(0, 30), ...w } : null;
           })
           .filter(Boolean)
+          .slice(0, MAX_CATEGORIES)
         : [];
-      s.usage = { fiveHour, sevenDay, extra: cleanExtra(u.extra), models };
+      s.usage = { fiveHour, sevenDay, extra: cleanExtra(u.extra), models, fields: cleanFields(u.fields) };
     }
   }
   if (isTime(raw.fetchedAt)) s.fetchedAt = raw.fetchedAt;
@@ -678,6 +779,8 @@ function buildView(rawState, now, error) {
     fiveHour: make(fh, FIVE_HOURS, state.samples5h, "5 小時", false),
     sevenDay: make(sd, SEVEN_DAYS, state.samples7d, "每週", true),
     models,
+    daily: dailyBreakdown(state.samples7d, now),
+    fields: usage ? usage.fields : [],
     extra,
     extraText: extraText(extra),
     extraLevel: extra && extra.enabled ? levelFor(extra.percent) : "none",
@@ -717,6 +820,9 @@ function summaryText(view, now) {
     parts.push(`每週 ${view.sevenDay.percent}%（${view.sevenDay.resetLabel}）`);
   }
   if (view.extraText) parts.push(`使用量額度 ${view.extraText}`);
+  if (view.daily.hasData && isNum(view.daily.today)) {
+    parts.push(`今天用掉每週額度 ${view.daily.today}%`);
+  }
   let text = `Claude 用量：${parts.join("；")}`;
   if (view.stale) {
     text += `（⚠️ ${errorInfo(view.error.kind).title}，資料為 ${fmtAgo(view.fetchedAt, now)}）`;
@@ -733,15 +839,16 @@ function demoState(now) {
   }
   const weekReset = now + 3 * DAY;
   const samples7d = [];
-  for (let i = 96; i >= 0; i--) {
-    samples7d.push({ t: now - i * 30 * MINUTE, p: Math.max(0, Math.round(18 - i * 0.12)), r: weekReset });
+  for (let i = 192; i >= 0; i--) {
+    samples7d.push({ t: now - i * 30 * MINUTE, p: Math.round(18 * Math.pow(1 - i / 192, 1.3)), r: weekReset });
   }
   return sanitizeState({
     usage: {
       fiveHour: { percent: 42, resetAt },
       sevenDay: { percent: 18, resetAt: weekReset },
       extra: { enabled: true, used: 3.2, limit: 50, percent: 6, currency: "USD" },
-      models: []
+      models: [],
+      fields: ["five_hour", "seven_day", "extra_usage"]
     },
     fetchedAt: now,
     orgName: "示範資料",
@@ -977,6 +1084,7 @@ const PALETTE = {
   text: () => Color.dynamic(new Color("#1F1E1D"), new Color("#F5F4EF")),
   dim: () => Color.dynamic(new Color("#6B6A64"), new Color("#A3A29C")),
   track: () => Color.dynamic(new Color("#E6E4DC"), new Color("#3A3936")),
+  bar: () => Color.dynamic(new Color("#BDB9AB"), new Color("#6B6862")),
   accent: () => new Color("#D97757"),
   green: () => Color.dynamic(new Color("#2E9E5B"), new Color("#4CC27A")),
   orange: () => Color.dynamic(new Color("#E08A00"), new Color("#FFB23F")),
@@ -1187,6 +1295,62 @@ function addRing(parent, win, diameter, line, fontSize, caption) {
   return ring;
 }
 
+// 每日用量長條圖（用 stack 疊出來，深淺色會自動換色）。今天用強調色。
+function addDailyBars(parent, daily, colW, barMaxH, showValues) {
+  const row = parent.addStack();
+  row.layoutHorizontally();
+  row.bottomAlignContent();
+  const scale = Math.max(daily.max, 5);
+  const barW = Math.max(6, Math.round(colW * 0.56));
+  const centered = (col, build) => {
+    const r = col.addStack();
+    r.layoutHorizontally();
+    r.addSpacer();
+    build(r);
+    r.addSpacer();
+  };
+  for (const day of daily.days) {
+    const col = row.addStack();
+    col.layoutVertically();
+    col.size = new Size(colW, barMaxH + 13 + (showValues ? 11 : 0));
+    col.addSpacer();
+    if (showValues) {
+      centered(col, (r) => addText(r, day.pct === null ? "–" : `${day.pct}`, Font.mediumSystemFont(8),
+        day.isToday ? PALETTE.accent() : PALETTE.dim()));
+    }
+    centered(col, (r) => {
+      const bar = r.addStack();
+      const h = day.pct ? Math.max(3, Math.round((barMaxH * day.pct) / scale)) : 2;
+      bar.size = new Size(barW, h);
+      bar.cornerRadius = Math.min(3, h / 2);
+      bar.backgroundColor = !day.pct ? PALETTE.track() : day.isToday ? PALETTE.accent() : PALETTE.bar();
+    });
+    col.addSpacer(2);
+    centered(col, (r) => addText(r, day.label, day.isToday ? Font.boldSystemFont(9) : Font.systemFont(9),
+      day.isToday ? PALETTE.text() : PALETTE.dim()));
+  }
+  return row;
+}
+
+// 每日用量長條圖（圖片版，給鎖定畫面和 App 詳細頁用）。
+function dailyBarsImage(daily, width, height, hex, todayHex) {
+  const ctx = newContext(width, height);
+  const n = daily.days.length;
+  const colW = width / n;
+  const barW = Math.max(3, colW * 0.6);
+  const scale = Math.max(daily.max, 5);
+  daily.days.forEach((day, i) => {
+    const h = day.pct ? Math.max(2, (height * day.pct) / scale) : 1.5;
+    const path = new Path();
+    const r = Math.min(2.5, h / 2);
+    path.addRoundedRect(new Rect(i * colW + (colW - barW) / 2, height - h, barW, h), r, r);
+    ctx.addPath(path);
+    ctx.setFillColor(day.isToday && day.pct ? new Color(todayHex) : new Color(hex, day.pct ? 0.55 : 0.3));
+    ctx.fillPath();
+  });
+  return ctx.getImage();
+}
+
 function addHeader(parent, title, rightText, rightColor) {
   const row = parent.addStack();
   row.layoutHorizontally();
@@ -1318,10 +1482,66 @@ function buildMedium(widget, view, now) {
   foot.addSpacer();
   if (view.extraText) {
     addText(foot, `使用量額度 ${view.extraText}`, Font.mediumSystemFont(10), levelColor(view.extraLevel));
-  } else if (view.sevenDay && view.sevenDay.pace) {
-    addText(foot, `本週節奏 ${view.sevenDay.pace.label}`, Font.mediumSystemFont(10),
-      levelColor(view.sevenDay.pace.level));
+  } else {
+    // 沒開使用量額度時，這裡顯示今天用了多少與本週節奏
+    const pace = view.sevenDay && view.sevenDay.pace;
+    const parts = [fmtToday(view.daily), pace ? `節奏${pace.label}` : ""].filter(Boolean);
+    if (parts.length) {
+      addText(foot, parts.join("・"), Font.mediumSystemFont(10), pace ? levelColor(pace.level) : PALETTE.dim());
+    }
   }
+}
+
+function whereFooterText(view) {
+  const cats = view.models.filter((m) => m.percent > 0).slice(0, 3);
+  if (cats.length) return cats.map((m) => `${m.label} ${m.percent}%`).join("・");
+  if (view.daily.periodsText) return `時段　${view.daily.periodsText}`;
+  return "累積資料中…（每次更新會記錄一筆）";
+}
+
+// 主畫面・小（參數「明細」）：今天用了多少＋近 7 天長條
+function buildSmallWhere(widget, view, now) {
+  const d = view.daily;
+  widget.backgroundColor = PALETTE.bg();
+  widget.setPadding(12, 12, 10, 12);
+  addHeader(widget, "Claude", "今天");
+  widget.addSpacer(4);
+  addText(widget, isNum(d.today) ? `+${d.today}%` : "--", Font.boldRoundedSystemFont(24), PALETTE.accent());
+  addText(widget, "佔每週額度", Font.mediumSystemFont(10), PALETTE.dim());
+  widget.addSpacer(4);
+  addDailyBars(widget, d, 16, 24, false);
+  widget.addSpacer();
+  addText(widget, statusLine(view, now), Font.systemFont(9), statusColor(view));
+}
+
+// 主畫面・中（參數「明細」）：近 7 天每日用量、今天、日均、時段或分類
+function buildMediumWhere(widget, view, now) {
+  const d = view.daily;
+  widget.backgroundColor = PALETTE.bg();
+  widget.setPadding(12, 14, 12, 14);
+  addHeader(widget, "Claude 用量去向", statusLine(view, now), statusColor(view));
+  widget.addSpacer(6);
+
+  const row = widget.addStack();
+  row.layoutHorizontally();
+  row.bottomAlignContent();
+  addDailyBars(row, d, 21, 38, true);
+  row.addSpacer(12);
+  const side = row.addStack();
+  side.layoutVertically();
+  addText(side, "今天用掉每週額度", Font.semiboldSystemFont(10), PALETTE.dim());
+  addText(side, isNum(d.today) ? `+${d.today}%` : "--", Font.boldRoundedSystemFont(22), PALETTE.accent());
+  if (isNum(d.avg)) {
+    addText(side, `近 7 天 +${d.total}%・日均 ${d.avg}%`, Font.mediumSystemFont(10), PALETTE.text());
+  }
+  if (view.sevenDay) {
+    addText(side, `每週 ${view.sevenDay.percent}%・${view.sevenDay.resetLabelShort}`, Font.mediumSystemFont(10),
+      levelColor(view.sevenDay.level));
+  }
+  row.addSpacer();
+
+  widget.addSpacer();
+  addText(widget, whereFooterText(view), Font.mediumSystemFont(10), PALETTE.dim());
 }
 
 // 主畫面・大：雙圓環＋兩條趨勢圖＋額度
@@ -1370,10 +1590,25 @@ function buildLarge(widget, view, now) {
       addText(widget, "累積資料中…（每次更新會記錄一筆）", Font.systemFont(10), PALETTE.dim());
     }
   };
-  section("近 5 小時趨勢", view.samples5h, FIVE_HOURS, 36, view.fiveHour);
-  section("近 7 天趨勢", view.samples7d, SEVEN_DAYS, 28, view.sevenDay);
+  section("近 5 小時趨勢", view.samples5h, FIVE_HOURS, 30, view.fiveHour);
 
+  // 用量花在哪：近 7 天每天用掉多少每週額度
+  const d = view.daily;
   widget.addSpacer(10);
+  const dh = widget.addStack();
+  dh.layoutHorizontally();
+  addText(dh, "每日用量（佔每週額度）", Font.semiboldSystemFont(10), PALETTE.dim());
+  dh.addSpacer();
+  const sum = [fmtToday(d), isNum(d.avg) ? `日均 ${d.avg}%` : ""].filter(Boolean).join("・");
+  if (sum) addText(dh, sum, Font.semiboldSystemFont(10), PALETTE.accent());
+  widget.addSpacer(3);
+  addDailyBars(widget, d, Math.floor(W / 7), 28, true);
+  if (d.periodsText && view.models.length < 2) {
+    widget.addSpacer(3);
+    addText(widget, `時段　${d.periodsText}`, Font.mediumSystemFont(10), PALETTE.dim());
+  }
+
+  widget.addSpacer(8);
   const ex = widget.addStack();
   ex.layoutHorizontally();
   addText(ex, "使用量額度", Font.semiboldSystemFont(10), PALETTE.dim());
@@ -1386,8 +1621,8 @@ function buildLarge(widget, view, now) {
   } else {
     addText(ex, "未開啟", Font.mediumSystemFont(10), PALETTE.dim());
   }
-  for (const m of view.models) {
-    widget.addSpacer(4);
+  for (const m of view.models.slice(0, 3)) {
+    widget.addSpacer(3);
     const r = widget.addStack();
     r.layoutHorizontally();
     addText(r, m.label, Font.semiboldSystemFont(10), PALETTE.dim());
@@ -1439,6 +1674,22 @@ function buildInline(widget, view, primaryKey) {
   widget.addText(`Claude ${tag} ${primary.percent}%・${tail}${view.stale ? "・離線" : ""}`);
 }
 
+function buildRectangularWhere(widget, view) {
+  const d = view.daily;
+  addText(widget, `Claude ${fmtToday(d) || "今天 --"}`, Font.boldSystemFont(13));
+  widget.addSpacer(2);
+  const img = widget.addImage(dailyBarsImage(d, 140, 18, "#FFFFFF", "#FFFFFF"));
+  img.imageSize = new Size(140, 18);
+  widget.addSpacer(2);
+  const week = view.sevenDay ? `・每週 ${view.sevenDay.percent}%` : "";
+  addText(widget, `近 7 天 +${d.total}%${week}${view.stale ? "・離線" : ""}`, Font.systemFont(11));
+}
+
+function buildInlineWhere(widget, view) {
+  const week = view.sevenDay ? `・週 ${view.sevenDay.percent}%` : "";
+  widget.addText(`Claude ${fmtToday(view.daily) || "今天 --"}${week}${view.stale ? "・離線" : ""}`);
+}
+
 function newWidget(now, usage, error) {
   const widget = new ListWidget();
   widget.refreshAfterDate = new Date(nextRefreshAt(usage, now, error));
@@ -1454,6 +1705,7 @@ function newWidget(now, usage, error) {
 function buildWidget(view, family, param, now, usage) {
   const widget = newWidget(now, usage, view.error);
   const primaryKey = parseParam(param) === "7d" ? "sevenDay" : "fiveHour";
+  const where = parseMode(param) === "where";
   if (!view.hasData) {
     return buildErrorWidget(widget, view.error || new UsageError("loading"), family);
   }
@@ -1462,20 +1714,24 @@ function buildWidget(view, family, param, now, usage) {
       buildCircular(widget, view, primaryKey);
       break;
     case "accessoryRectangular":
-      buildRectangular(widget, view, primaryKey, now);
+      if (where) buildRectangularWhere(widget, view);
+      else buildRectangular(widget, view, primaryKey, now);
       break;
     case "accessoryInline":
-      buildInline(widget, view, primaryKey);
+      if (where) buildInlineWhere(widget, view);
+      else buildInline(widget, view, primaryKey);
       break;
     case "small":
-      buildSmall(widget, view, primaryKey, now);
+      if (where) buildSmallWhere(widget, view, now);
+      else buildSmall(widget, view, primaryKey, now);
       break;
     case "large":
     case "extraLarge":
       buildLarge(widget, view, now);
       break;
     default:
-      buildMedium(widget, view, now);
+      if (where) buildMediumWhere(widget, view, now);
+      else buildMedium(widget, view, now);
   }
   return widget;
 }
@@ -1498,7 +1754,10 @@ async function previewWidget(state, error, presetFamily) {
     ["主畫面・大", "large", "presentLarge"],
     ["鎖定畫面・圓環", "accessoryCircular", "presentAccessoryCircular"],
     ["鎖定畫面・長條", "accessoryRectangular", "presentAccessoryRectangular"],
-    ["鎖定畫面・單行", "accessoryInline", "presentAccessoryInline"]
+    ["鎖定畫面・單行", "accessoryInline", "presentAccessoryInline"],
+    ["用量去向・中（參數「明細」）", "medium", "presentMedium", "明細"],
+    ["用量去向・小（參數「明細」）", "small", "presentSmall", "明細"],
+    ["用量去向・鎖定畫面長條", "accessoryRectangular", "presentAccessoryRectangular", "明細"]
   ];
   let idx = options.findIndex((o) => o[1] === presetFamily);
   if (idx < 0) {
@@ -1510,8 +1769,8 @@ async function previewWidget(state, error, presetFamily) {
   }
   if (idx < 0 || idx >= options.length) return;
   const now = Date.now();
-  const [, family, method] = options[idx];
-  const widget = buildWidget(buildView(state, now, error), family, args.widgetParameter, now, state.usage);
+  const [, family, method, param] = options[idx];
+  const widget = buildWidget(buildView(state, now, error), family, param || args.widgetParameter, now, state.usage);
   if (typeof widget[method] === "function") await widget[method]();
 }
 
@@ -1703,9 +1962,6 @@ function detailRows(table, view, settings, now, handlers) {
       w.pace ? 84 : 64
     );
   }
-  for (const m of view.models) {
-    addInfo(`${m.label}：${m.percent}%`, m.resetWhen ? `${m.resetWhen} 重置` : "", levelColor(m.level), 54);
-  }
   if (view.extra && view.extra.enabled) {
     const pct = isNum(view.extra.percent) ? `（${view.extra.percent}%）` : "";
     addInfo(`使用量額度：${view.extraText}${pct}`, "已花 / 每月上限", levelColor(view.extraLevel));
@@ -1716,6 +1972,50 @@ function detailRows(table, view, settings, now, handlers) {
     view.updatedText,
     view.fetchedAt ? `資料時間 ${fmtWhen(view.fetchedAt, now)}（台灣時間）` : "尚無成功的資料"
   );
+
+  if (view.hasData) {
+    const d = view.daily;
+    const where = new UITableRow();
+    where.isHeader = true;
+    where.addText("用量花在哪");
+    table.addRow(where);
+    if (d.hasData) {
+      const busiest = d.busiest ? `\n最多的一天：${d.busiest.isToday ? "今天" : `週${d.busiest.label}`} +${d.busiest.pct}%` : "";
+      addInfo(
+        `今天用掉每週額度：+${isNum(d.today) ? d.today : 0}%`,
+        `近 7 天共 +${d.total}%，平均每天 ${isNum(d.avg) ? d.avg : 0}%${busiest}`,
+        PALETTE.accent(),
+        74
+      );
+      const chart = new UITableRow();
+      chart.height = 80;
+      const t = chart.addText("每日", "近 7 天");
+      t.widthWeight = 25;
+      const img = chart.addImage(dailyBarsImage(d, 300, 60, IMAGE_COLORS.track, "#D97757"));
+      img.widthWeight = 75;
+      table.addRow(chart);
+      addInfo(
+        "每日明細",
+        d.days.map((x) => `${x.isToday ? "今天" : x.label} ${x.pct === null ? "–" : `${x.pct}%`}`).join("・"),
+        null,
+        54
+      );
+      if (d.periodsText) addInfo("時段分布", d.periodsText, null, 54);
+    } else {
+      addInfo("累積資料中…", "小工具每次更新會記錄一筆，過一陣子就能看到每天用了多少");
+    }
+    for (const m of view.models) {
+      addInfo(`${m.label}：${m.percent}%`, m.resetWhen ? `${m.resetWhen} 重置` : "", levelColor(m.level), 54);
+    }
+    if (view.fields.length) {
+      addInfo(
+        "claude.ai 提供的欄位",
+        `${view.fields.join("、")}\n只有這些分類能顯示；claude.ai 不提供每個對話或專案的明細`,
+        null,
+        74
+      );
+    }
+  }
 
   const section = new UITableRow();
   section.isHeader = true;
@@ -1855,7 +2155,7 @@ const __api = {
   parseIsoTime, parseTime, parseWindow, parseExtra, normalizeUsage, pickOrganization, levelFor,
   currentWindow, sameWindow, recordSample, predictExhaust, paceFor, taipeiParts, fmtClock, fmtWhen,
   fmtDuration, fmtDurationShort, fmtCountdown, fmtAgo, fmtMoney, predictionText, predictionShort,
-  extraText, parseParam, nextRefreshAt, cleanSettings, sanitizeState, planNotifications,
+  extraText, parseParam, parseMode, usageDeltas, dailyBreakdown, windowLabel, nextRefreshAt, cleanSettings, sanitizeState, planNotifications,
   applySuccess, buildView, statusLine, summaryText, demoState, sparkImage, ringImage,
   apiGet, fetchUsage, refresh, applyNotifications, buildWidget, loadState, saveState,
   loadSettings, saveSettings, resetCredentials, setupWizard, settingsMenu, showDetail, main,

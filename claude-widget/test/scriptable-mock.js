@@ -58,6 +58,7 @@ class WidgetStack {
   layoutVertically() {}
   centerAlignContent() {}
   topAlignContent() {}
+  bottomAlignContent() {}
   setPadding() {}
 }
 

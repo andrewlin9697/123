@@ -306,23 +306,27 @@ test("登入失效：發一次通知，之後不重複", async () => {
   assert.equal(env.scheduled.length, 1);
 });
 
-test("大尺寸：雙圓環、兩條趨勢、額度條；資料累積後畫出趨勢圖", async () => {
+test("大尺寸：雙圓環、5 小時趨勢、每日用量長條、額度條", async () => {
   const env = widgetEnv("large");
   let texts = await run(env);
   assert.ok(texts.includes("近 5 小時趨勢"));
-  assert.ok(texts.includes("近 7 天趨勢"));
+  assert.ok(texts.includes("每日用量（佔每週額度）"));
   assert.ok(texts.includes("累積資料中…（每次更新會記錄一筆）"));
   assert.ok(texts.includes("$3.20 / $50.00（6%）"));
   assert.ok(texts.includes("節奏從容"));
+  // 七天的星期標籤：今天是週一，所以最右邊是「一」
+  const labels = texts.filter((t) => /^[日一二三四五六]$/.test(t));
+  assert.deepEqual([...labels], ["二", "三", "四", "五", "六", "日", "一"]);
 
   for (let i = 1; i <= 3; i++) {
     env.setNow(NOW + i * 10 * MIN);
     texts = await run(env);
   }
-  // 5 小時與每週各累積了 3 筆以上，兩條趨勢圖都畫得出來
+  // 累積幾筆之後，5 小時趨勢圖畫得出來
   assert.ok(!texts.includes("累積資料中…（每次更新會記錄一筆）"));
   const sparks = collectImages(env.setWidget).filter((img) => img && img.kind === "image");
-  assert.equal(sparks.length, 2);
+  assert.equal(sparks.length, 1);
+  assert.ok(texts.includes("今天 +0%・日均 0%"));
 });
 
 test("從捷徑執行：輸出文字摘要", async () => {
